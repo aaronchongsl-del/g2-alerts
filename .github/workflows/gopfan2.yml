@@ -1,0 +1,39 @@
+name: gopfan2 alerts
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"      # GitHub may delay this by several minutes
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test notification only"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write              # lets the job save state.json back to the repo
+
+concurrency:
+  group: gopfan2-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check for new trades
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST: ${{ inputs.test && '1' || '0' }}
+        run: python notify.py
+      - name: Save state
+        run: |
+          git config user.name "alerts-bot"
+          git config user.email "alerts-bot@users.noreply.github.com"
+          git add state.json || true
+          git diff --cached --quiet || (git commit -m "update state" && git pull --rebase -q && git push -q)
