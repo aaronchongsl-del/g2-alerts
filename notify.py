@@ -8,7 +8,9 @@ Fills are grouped per market+side, so 460 tiny fills in one market become ONE al
 Env vars:
   NTFY_TOPIC   required  your private ntfy topic (store as a GitHub secret)
   WALLET       default gopfan2's proxy wallet
-  MIN_USD      default 25    ignore a grouped trade smaller than this
+  MIN_USD      default 25    alert once a market+side's running total reaches this (small fills accumulate across runs)
+  FLUSH_MINUTES default 60   a running total older than this is sent if >= FLUSH_MIN_USD, otherwise dropped
+  FLUSH_MIN_USD default 10
   BIG_USD      default 1000  trades at/above this get high priority
   MAX_ALERTS   default 6     separate alerts per run; the rest are rolled into one summary
   NTFY_SERVER  default https://ntfy.sh
@@ -25,6 +27,8 @@ MIN_USD = float(os.environ.get("MIN_USD", "25"))
 BIG_USD = float(os.environ.get("BIG_USD", "1000"))
 MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "6"))
 STATE = Path(os.environ.get("STATE_FILE", "state.json"))
+FLUSH_S = int(os.environ.get("FLUSH_MINUTES", "60")) * 60
+FLUSH_MIN_USD = float(os.environ.get("FLUSH_MIN_USD", "10"))
 KEEP = 3000  # fill keys remembered
 
 
@@ -89,20 +93,26 @@ def main():
         print(f"first run: remembered {len(new)} existing fills, no alerts sent")
         new = []
         push("gopfan2 alerts are on", f"Watching {WALLET[:8]}... You will get an alert when he trades (min {money(MIN_USD)}).", tags=["eyes"])
-    groups = {}
+    pending = state.get("pending", {})
     for r in new:
-        groups.setdefault((r.get("conditionId"), r.get("asset"), r.get("side")), []).append(r)
-    items = []
-    for (_, _, side), g in groups.items():
-        shares = sum(float(x["size"]) for x in g)
-        usd = sum(float(x["usdcSize"]) for x in g)
-        if shares <= 0 or usd < MIN_USD:
-            continue
-        x = g[0]
-        slug = x.get("eventSlug") or x.get("slug")
-        items.append(dict(side=side, usd=usd, shares=shares, px=usd / shares, n=len(g), title=x.get("title", "?"),
-                          outcome=x.get("outcome", "?"), ts=max(int(y["timestamp"]) for y in g),
-                          link=f"https://polymarket.com/event/{slug}" if slug else None))
+        k = f"{r.get('conditionId')}|{r.get('asset')}|{r.get('side')}"
+        p = pending.setdefault(k, dict(usd=0.0, shares=0.0, n=0, side=r.get("side"), title=r.get("title", "?"),
+                                       outcome=r.get("outcome", "?"), first=int(r["timestamp"]),
+                                       slug=r.get("eventSlug") or r.get("slug")))
+        p["usd"] += float(r["usdcSize"]); p["shares"] += float(r["size"]); p["n"] += 1
+        p["first"] = min(p["first"], int(r["timestamp"]))
+    items, nowt = [], int(time.time())
+    for k in list(pending):
+        p = pending[k]
+        if p["shares"] <= 0:
+            del pending[k]
+        elif p["usd"] >= MIN_USD or (nowt - p["first"] > FLUSH_S and p["usd"] >= FLUSH_MIN_USD):
+            items.append(dict(side=p["side"], usd=p["usd"], shares=p["shares"], px=p["usd"] / p["shares"], n=p["n"],
+                              title=p["title"], outcome=p["outcome"],
+                              link=f"https://polymarket.com/event/{p['slug']}" if p.get("slug") else None))
+            del pending[k]
+        elif nowt - p["first"] > FLUSH_S:
+            del pending[k]  # too small to bother you with, and too old to keep waiting on
     items.sort(key=lambda i: -i["usd"])
     for i in items[:MAX_ALERTS]:
         t = f"gopfan2 {i['side']} {money(i['usd'])} {i['outcome']} @ {i['px']:.2f}"
@@ -112,8 +122,9 @@ def main():
     if rest:
         lines = [f"{i['side']} {money(i['usd'])} {i['outcome']} @ {i['px']:.2f}: {i['title'][:50]}" for i in rest[:15]]
         push(f"gopfan2: {len(rest)} more trades", "\n".join(lines), priority=2)
+    print(f"{len(pending)} waiting below threshold;", end=" ")
     print(f"{len(new)} new fills -> {len(items)} grouped trades -> {min(len(items), MAX_ALERTS) + (1 if rest else 0)} alerts")
-    STATE.write_text(json.dumps({"seen": seen[-KEEP:], "updated": int(time.time())}))
+    STATE.write_text(json.dumps({"seen": seen[-KEEP:], "pending": pending, "updated": int(time.time())}))
 
 
 if __name__ == "__main__":
