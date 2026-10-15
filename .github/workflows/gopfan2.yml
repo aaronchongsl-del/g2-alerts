@@ -1,4 +1,4 @@
-name: gopfan2 alerts
+name: copy alerts (gopfan2 + mr.ozi)
 
 on:
   schedule:
