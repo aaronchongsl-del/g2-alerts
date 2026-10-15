@@ -6,9 +6,11 @@ Read-only: public data-api, no keys, no trading.
 Meant to run every ~5 minutes on GitHub Actions. State (which fills it has already told you about) lives in state.json.
 Fills are grouped per trader+market+side, so 460 tiny fills in one market become ONE alert.
 
-Copy sizing: your BANKROLL is split equally between the traders. Each trader's buy is scaled by
-(your share of the bankroll / that trader's typical deployed capital), capped at MAX_COPY_PCT of the bankroll.
-Buys whose suggested size is under MIN_ORDER_USD are not alerted. Sells are alerted only for markets you were told
+Copy sizing: your BANKROLL is split equally between the traders. They mostly use limit orders that fill bit by bit,
+so a single batch of fills says little about the size of the bet. Instead, each time he buys, the alert looks up his
+WHOLE position in that outcome and sets your target = his position cost x (your share of the bankroll / his typical
+deployed capital), capped at MAX_COPY_PCT of the bankroll. You are told to buy the gap between that target and what
+you were already told to buy; a gap under MIN_ORDER_USD is not alerted (it may become one as more of his order fills). Sells are alerted only for markets you were told
 to buy (remembered in state.json), and say what percent of his position he sold, so you sell the same percent of
 yours (mr.ozi often exits before resolution).
 
@@ -83,12 +85,15 @@ def fetch_activity(wallet):
     return None
 
 
-def shares_held(wallet, condition_id, asset):
-    """His current share count in one outcome token, or None if the lookup fails."""
+def his_position(wallet, condition_id, asset):
+    """(shares, cost in $) he holds in one outcome token now, or None if the lookup fails."""
     j = get_list("/positions", {"user": wallet, "market": condition_id, "sizeThreshold": 0})
     if j is None:
         return None
-    return sum(float(p.get("size") or 0) for p in j if str(p.get("asset")) == str(asset))
+    ps = [p for p in j if str(p.get("asset")) == str(asset)]
+    shares = sum(float(p.get("size") or 0) for p in ps)
+    cost = sum(float(p.get("initialValue") or float(p.get("size") or 0) * float(p.get("avgPrice") or 0)) for p in ps)
+    return shares, cost
 
 
 def key(r):
@@ -106,20 +111,27 @@ def money(x):
     return f"${x:,.0f}" if x >= 100 else f"${x:,.2f}"
 
 
-def copy_line(t, i):
-    """Suggested action for your account."""
+def copy_line(t, i, copied):
+    """Suggested action for your account, and the $ to buy (BUY) or % to sell (SELL).
+    Buys are sized off his whole position in the market, not this one batch of fills: his limit orders fill
+    bit by bit, so each alert tops your position up to its target and says how much you should hold in total."""
+    scale = (BANKROLL / len(TRADERS)) / t["capital"]
+    pos = his_position(t["wallet"], i["cid"], i["asset"])
+    have = copied.get(i["asset"], {}).get("usd", 0.0)
     if i["side"] == "BUY":
-        amt = i["usd"] * (BANKROLL / len(TRADERS)) / t["capital"]
+        his_cost = pos[1] if pos else i["usd"]
+        target = min(his_cost * scale, MAX_COPY)
+        amt = target - have
         if amt < MIN_ORDER:
-            return f"Copy: too small (would be {money(amt)})", None
-        amt = min(amt, MAX_COPY)
-        return f"Copy: BUY {money(amt)} of {i['outcome']} up to {min(i['px'] + 0.02, 0.99):.2f}", amt
-    held = shares_held(t["wallet"], i["cid"], i["asset"])
-    if held is None:
+            return f"Copy: nothing yet (target {money(target)}, you have {money(have)})", None
+        return (f"Copy: BUY {money(amt)} of {i['outcome']} up to {min(i['px'] + 0.02, 0.99):.2f}\n"
+                f"Target {money(target)} in this market; he holds {money(his_cost)}"), amt
+    if pos is None:
         return "Copy: sell your position in proportion (could not read his remaining size)", None
-    pct = 100 * i["shares"] / (i["shares"] + held) if i["shares"] + held > 0 else 100
+    held = pos[0]
     if held < 1:
         return "Copy: he has exited, SELL all of yours", 100
+    pct = 100 * i["shares"] / (i["shares"] + held)
     return f"Copy: SELL {pct:.0f}% of your {i['outcome']} shares", pct
 
 
@@ -149,14 +161,13 @@ def run_trader(t, ts, nowt):
                                        slug=r.get("eventSlug") or r.get("slug")))
         p["usd"] += float(r["usdcSize"]); p["shares"] += float(r["size"]); p["n"] += 1
         p["first"] = min(p["first"], int(r["timestamp"]))
-    copied = ts.get("copied", {})  # asset -> title of markets you were told to buy
-    buy_thr = max(MIN_USD, MIN_ORDER * t["capital"] * len(TRADERS) / BANKROLL)  # his buy size that makes a copyable order
+    copied = ts.get("copied", {})  # asset -> {"title", "usd" you were told to buy so far}
     items = []
     for k in list(pending):
         p = pending[k]
         if p["shares"] <= 0:
             del pending[k]
-        elif p["usd"] >= (buy_thr if p["side"] == "BUY" and not SHOW_ALL else MIN_USD) or (nowt - p["first"] > FLUSH_S and p["usd"] >= FLUSH_MIN_USD):
+        elif p["usd"] >= MIN_USD or (nowt - p["first"] > FLUSH_S and p["usd"] >= FLUSH_MIN_USD):
             cid, asset, _ = k.split("|")
             items.append(dict(side=p["side"], usd=p["usd"], shares=p["shares"], px=p["usd"] / p["shares"], n=p["n"],
                               title=p["title"], outcome=p["outcome"], cid=cid, asset=asset,
@@ -168,13 +179,16 @@ def run_trader(t, ts, nowt):
     for i in sorted(items, key=lambda i: -i["usd"]):
         if i["side"] == "SELL" and i["asset"] not in copied and not SHOW_ALL:
             continue
-        i["line"], amt = copy_line(t, i)
+        i["line"], amt = copy_line(t, i, copied)
         if i["side"] == "BUY" and amt is None and not SHOW_ALL:
             continue
         if i["side"] == "BUY" and amt is not None:
-            copied[i["asset"]] = i["title"]
+            c = copied.setdefault(i["asset"], {"title": i["title"], "usd": 0.0})
+            c["usd"] += amt
         if i["side"] == "SELL" and amt == 100:
             copied.pop(i["asset"], None)
+        elif i["side"] == "SELL" and amt is not None and i["asset"] in copied:
+            copied[i["asset"]]["usd"] *= 1 - amt / 100
         shown.append(i)
     items = shown
     for i in items[:MAX_ALERTS]:
