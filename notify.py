@@ -38,21 +38,39 @@ def http(url, data=None, timeout=20):
         return r.status, r.read()
 
 
+# Data API v2 (v1 was retired on 2026-11-02 and now answers 410). v2 wraps rows in {"data": [...]} and uses
+# snake_case names; v2_row() maps them back to the names the rest of this script uses.
+V2_NAMES = {"transaction_hash": "transactionHash", "token_id": "asset", "condition_id": "conditionId",
+            "usdc_size": "usdcSize", "event_slug": "eventSlug", "proxy_wallet": "proxyWallet"}
+
+
+def v2_row(r):
+    r = dict(r)
+    for new, old in V2_NAMES.items():
+        if new in r and old not in r:
+            r[old] = r[new]
+    return r
+
+
 def fetch_activity():
-    for limit in (500, 200):
-        q = urllib.parse.urlencode({"user": WALLET, "type": "TRADE", "limit": limit, "sortBy": "TIMESTAMP", "sortDirection": "DESC"})
-        for attempt in range(3):
-            try:
-                st, body = http(f"{DATA}/activity?{q}")
-                j = json.loads(body)
-                if isinstance(j, list):
-                    return j
-            except urllib.error.HTTPError as e:
-                if e.code == 400:
-                    break  # limit too high, try smaller
-                time.sleep(2 * (attempt + 1))
-            except Exception:
-                time.sleep(2 * (attempt + 1))
+    q = urllib.parse.urlencode({"user": WALLET, "type": "TRADE", "limit": 500, "sortBy": "TIMESTAMP", "sortDirection": "DESC"})
+    err = None
+    for attempt in range(3):
+        try:
+            st, body = http(f"{DATA}/v2/activity?{q}")
+            j = json.loads(body)
+            rows = j.get("data") if isinstance(j, dict) else j
+            if isinstance(rows, list):
+                return [v2_row(r) for r in rows]
+            err = f"unexpected response: {body[:200]!r}"
+        except urllib.error.HTTPError as e:
+            err = f"HTTP {e.code}: {e.read()[:200]!r}"
+            if e.code in (400, 404, 410):
+                break  # not transient, retrying will not help
+        except Exception as e:
+            err = repr(e)
+        time.sleep(2 * (attempt + 1))
+    print(f"activity fetch failed: {err}")
     return None
 
 
@@ -85,6 +103,14 @@ def main():
     seen = list(state.get("seen", []))
     seen_set = set(seen)
     first_run = not state
+    if state and state.get("api") != 2:
+        # v2 formats size/price differently, so v1-era fill keys no longer match. Treat every fill from before the
+        # last successful v1 run as already seen, so the switch does not re-send old alerts.
+        cutoff = int(state.get("updated", 0))
+        for r in rows:
+            if int(r["timestamp"]) <= cutoff and key(r) not in seen_set:
+                seen.append(key(r)); seen_set.add(key(r))
+        print(f"switched to Data API v2: fills up to {cutoff} marked as seen")
     new = [r for r in rows if key(r) not in seen_set]
     for r in sorted(new, key=lambda r: int(r["timestamp"])):
         seen.append(key(r))
@@ -108,7 +134,7 @@ def main():
             del pending[k]
         elif p["usd"] >= MIN_USD or (nowt - p["first"] > FLUSH_S and p["usd"] >= FLUSH_MIN_USD):
             items.append(dict(side=p["side"], usd=p["usd"], shares=p["shares"], px=p["usd"] / p["shares"], n=p["n"],
-                              title=p["title"], outcome=p["outcome"],
+                              title=p["title"], outcome=p["outcome"], first=p["first"],
                               link=f"https://polymarket.com/event/{p['slug']}" if p.get("slug") else None))
             del pending[k]
         elif nowt - p["first"] > FLUSH_S:
@@ -117,6 +143,8 @@ def main():
     for i in items[:MAX_ALERTS]:
         t = f"gopfan2 {i['side']} {money(i['usd'])} {i['outcome']} @ {i['px']:.2f}"
         m = f"{i['title']}\n{i['shares']:,.0f} shares in {i['n']} fill{'s' if i['n'] > 1 else ''}"
+        if nowt - i["first"] > 1800:
+            m += f"\n(late alert: first fill {(nowt - i['first']) / 3600:.0f}h ago)"
         push(t, m, i["link"], 4 if i["usd"] >= BIG_USD else 3, ["chart_with_upwards_trend" if i["side"] == "BUY" else "moneybag"])
     rest = items[MAX_ALERTS:]
     if rest:
@@ -124,7 +152,7 @@ def main():
         push(f"gopfan2: {len(rest)} more trades", "\n".join(lines), priority=2)
     print(f"{len(pending)} waiting below threshold;", end=" ")
     print(f"{len(new)} new fills -> {len(items)} grouped trades -> {min(len(items), MAX_ALERTS) + (1 if rest else 0)} alerts")
-    STATE.write_text(json.dumps({"seen": seen[-KEEP:], "pending": pending, "updated": int(time.time())}))
+    STATE.write_text(json.dumps({"seen": seen[-KEEP:], "pending": pending, "updated": int(time.time()), "api": 2}))
 
 
 if __name__ == "__main__":
